@@ -9,6 +9,11 @@ applications through the accessibility tree. On GNOME/X11, agent-desktop's curso
 rendered and newly launched windows appear on the user's workspace. `adc` addresses both issues
 and extends the tool into a complete, isolated working environment for an agent.
 
+![The agent drawing in Excalidraw on its own private display, with the agent cursor and intent labels](docs/demo.gif)
+
+*Recorded with `examples/excalidraw-demo.sh`: the agent draws on its private display while the
+user's pointer and workspace remain untouched.*
+
 ## Features
 
 - **Dedicated workspace.** The agent works on its own GNOME workspace. Windows are created there
