@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+"""adc: agent-desktop wrapper for Linux X11 with a visual agent cursor on its own workspace.
+
+Guarantees (unless ADC_ALLOW_PHYSICAL=1):
+  * never moves the real pointer, never sends physical keys/mouse, never takes focus,
+    never touches the shared clipboard -> the user keeps working on another workspace;
+  * windows the agent launches are moved to the agent workspace and focus is handed back;
+  * the agent cursor is drawn only on the agent workspace.
+
+Usage:
+  adc start [--desktop N|new] [--name NAME]   start session + overlay (prints export line)
+  adc stop                                    end session, kill overlay
+  adc status                                  state + overlay ping
+  adc launch APP [agent-desktop launch args]  launch, move windows to agent desktop
+  adc windows                                 X11 windows on the agent desktop
+  adc adopt <xid|--app NAME>                  move an existing window to the agent desktop
+  adc <any agent-desktop command ...>         pass-through; ref actions animate the cursor
+Nested mode (private X server on the agent workspace; physical input allowed, never reaches the user):
+  adc start --nested [--size 1600x900] [--record FILE.mp4] [--desktop N]
+  adc see [--scale 0.5] [--grid 100] [--region x,y,w,h] [--out F]   screenshot + coordinate grid
+  adc click-xy X Y [--label T] [--mods ctrl+shift] | double-xy | right-xy | move X Y
+  adc drag-xy X1 Y1 X2 Y2 | scroll-xy X Y up|down|left|right [N]
+  adc key ctrl+l Return ... | write "text" [--delay ms]
+  adc browser URL [--profile "Profile 1"]    Chrome inside, copy of a user profile (settings/bookmarks)
+  adc run CMD ARGS...  [--real-dbus]          any app inside the nested display
+  adc record start [FILE] | record stop
+  adc browser URL [--name linkedin]          persistent agent browser profile (log in once)
+  adc ask-user "Please sign in to LinkedIn" [--title T] [--timeout s]   system notification, user hands off
+  adc key/write ... [--target "window title"] -> data.focused = window that received the input
+Extra flags (stripped before agent-desktop sees them):
+  --adc-label "text"   label shown on the cursor for this action
+Env: ADC_AGENT (cursor id / colour; also forwarded as --agent-id if AGENT_DESKTOP_AGENT_ID set),
+     ADC_ALLOW_PHYSICAL=1 to lift the policy (only with the user's explicit OK).
+"""
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+RUN = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/adc-{os.getuid()}"), "adc")
+STATE = os.path.join(RUN, "state.json")
+AD = os.environ.get("ADC_AGENT_DESKTOP_BIN", "agent-desktop")
+REF_RE = re.compile(r"^@[A-Za-z0-9]+:e\d+$")
+
+REF_ACTIONS = {"click", "right-click", "type", "set-value", "clear", "select", "toggle", "check",
+               "uncheck", "expand", "collapse", "scroll-to", "focus"}
+TYPE_ACTIONS = {"type", "set-value", "clear"}
+# Physical input, focus stealing, shared clipboard, shell UI the user is looking at.
+BLOCKED = {"focus-window", "hover", "drag", "double-click", "triple-click", "mouse-move", "mouse-click",
+           "mouse-down", "mouse-up", "mouse-wheel", "scroll", "key-down", "key-up", "clipboard-get",
+           "clipboard-set", "clipboard-clear", "open-system-surface", "dismiss-notification",
+           "dismiss-all-notifications", "notification-action", "cursor-overlay", "focus"}
+
+
+def out(obj):
+    print(json.dumps(obj, ensure_ascii=False))
+
+
+def fail(code, msg, suggestion=None, cmd="adc"):
+    err = {"code": code, "message": msg, "disposition": {"delivery": "not_delivered", "retry": "safe"}}
+    if suggestion:
+        err["suggestion"] = suggestion
+    out({"ok": False, "command": cmd, "error": err})
+    sys.exit(1)
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def save_state(st):
+    os.makedirs(RUN, mode=0o700, exist_ok=True)
+    with open(STATE, "w") as f:
+        json.dump(st, f)
+
+
+def sh(args, **kw):
+    return subprocess.run(args, capture_output=True, text=True, **kw)
+
+
+def root_prop(name):
+    o = sh(["xprop", "-root", name]).stdout.strip()
+    # "NAME(CARDINAL) = 1"  or  "NAME(WINDOW): window id # 0x1, 0x2"
+    m = re.match(r"^[^(]*\([^)]*\)\s*(?:=|:)\s*(.*)$", o, re.S)
+    return m.group(1).strip() if m else ""
+
+
+def current_desktop():
+    try:
+        return int(root_prop("_NET_CURRENT_DESKTOP"))
+    except ValueError:
+        return 0
+
+
+def num_desktops():
+    try:
+        return int(root_prop("_NET_NUMBER_OF_DESKTOPS"))
+    except ValueError:
+        return 1
+
+
+def client_list():
+    v = root_prop("_NET_CLIENT_LIST")
+    return [int(x, 16) for x in re.findall(r"0x[0-9a-fA-F]+", v)]
+
+
+def active_window():
+    m = re.search(r"0x[0-9a-fA-F]+", root_prop("_NET_ACTIVE_WINDOW"))
+    return int(m.group(0), 16) if m else 0
+
+
+def win_desktop(xid):
+    o = sh(["xprop", "-id", hex(xid), "_NET_WM_DESKTOP"]).stdout
+    m = re.search(r"=\s*(-?\d+)", o)
+    return int(m.group(1)) if m else None
+
+
+def win_info(xid):
+    o = sh(["xprop", "-id", hex(xid), "_NET_WM_PID", "WM_CLASS", "_NET_WM_NAME", "_NET_WM_DESKTOP"]).stdout
+    info = {"xid": hex(xid)}
+    for line in o.splitlines():
+        if line.startswith("_NET_WM_PID"):
+            info["pid"] = int(line.split("=")[1])
+        elif line.startswith("WM_CLASS"):
+            info["class"] = re.findall(r'"([^"]*)"', line)
+        elif line.startswith("_NET_WM_NAME"):
+            m = re.search(r'"(.*)"', line)
+            info["title"] = m.group(1) if m else ""
+        elif line.startswith("_NET_WM_DESKTOP"):
+            info["desktop"] = int(line.split("=")[1])
+    return info
+
+
+def x11_startup_message(msg):
+    """Broadcast a startup-notification message (freedesktop startup-notification spec).
+
+    Mutter reads DESKTOP= from the "new:" message and maps the app's first window directly
+    on that workspace; a stale TIMESTAMP keeps focus-stealing prevention from activating it.
+    """
+    import ctypes as C
+    x = C.CDLL("libX11.so.6")
+    x.XOpenDisplay.restype = C.c_void_p
+    x.XOpenDisplay.argtypes = [C.c_char_p]
+    x.XDefaultRootWindow.restype = C.c_ulong
+    x.XDefaultRootWindow.argtypes = [C.c_void_p]
+    x.XCreateSimpleWindow.restype = C.c_ulong
+    x.XCreateSimpleWindow.argtypes = [C.c_void_p, C.c_ulong, C.c_int, C.c_int, C.c_uint, C.c_uint,
+                                      C.c_uint, C.c_ulong, C.c_ulong]
+    x.XInternAtom.restype = C.c_ulong
+    x.XInternAtom.argtypes = [C.c_void_p, C.c_char_p, C.c_int]
+    x.XSendEvent.argtypes = [C.c_void_p, C.c_ulong, C.c_int, C.c_long, C.c_void_p]
+    x.XDestroyWindow.argtypes = [C.c_void_p, C.c_ulong]
+    x.XFlush.argtypes = [C.c_void_p]
+    x.XSync.argtypes = [C.c_void_p, C.c_int]
+    x.XCloseDisplay.argtypes = [C.c_void_p]
+
+    class XClientData(C.Union):  # union { char b[20]; short s[10]; long l[5]; } -> long-aligned
+        _fields_ = [("b", C.c_char * 20), ("l", C.c_long * 5)]
+
+    class XClientMessageEvent(C.Structure):
+        _fields_ = [("type", C.c_int), ("serial", C.c_ulong), ("send_event", C.c_int),
+                    ("display", C.c_void_p), ("window", C.c_ulong), ("message_type", C.c_ulong),
+                    ("format", C.c_int), ("data", XClientData)]
+
+    class XEvent(C.Union):
+        _fields_ = [("xclient", XClientMessageEvent), ("pad", C.c_long * 24)]
+
+    dpy = x.XOpenDisplay(None)
+    if not dpy:
+        return False
+    root = x.XDefaultRootWindow(dpy)
+    win = x.XCreateSimpleWindow(dpy, root, -100, -100, 1, 1, 0, 0, 0)
+    begin = x.XInternAtom(dpy, b"_NET_STARTUP_INFO_BEGIN", 0)
+    more = x.XInternAtom(dpy, b"_NET_STARTUP_INFO", 0)
+    data = msg.encode() + b"\0"
+    for i in range(0, len(data), 20):
+        ev = XEvent()
+        ev.xclient.type = 33  # ClientMessage
+        ev.xclient.send_event = 1
+        ev.xclient.display = dpy
+        ev.xclient.window = win
+        ev.xclient.message_type = begin if i == 0 else more
+        ev.xclient.format = 8
+        C.memmove(C.addressof(ev.xclient.data), data[i:i + 20].ljust(20, b"\0"), 20)
+        x.XSendEvent(dpy, root, 0, 1 << 22, C.byref(ev))  # PropertyChangeMask
+    x.XSync(dpy, 0)
+    x.XDestroyWindow(dpy, win)
+    x.XCloseDisplay(dpy)
+    return True
+
+
+def sn_quote(v):
+    return '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def move_to_desktop(xid, n):
+    sh(["xdotool", "set_desktop_for_window", str(xid), str(n)])
+
+
+def overlay(req, st=None):
+    st = st or load_state()
+    if not st:
+        return None
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2)
+        s.connect(st["socket"])
+        s.sendall((json.dumps(req) + "\n").encode())
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        s.close()
+        return json.loads(data or b"null")
+    except (OSError, ValueError):
+        return None
+
+
+def ad(args, st=None, capture=True):
+    env = dict(os.environ)
+    st = st or load_state()
+    if st and st.get("mode") == "nested":
+        import adc_nested as N
+        env = N.nenv(st)
+    if st and not env.get("AGENT_DESKTOP_SESSION"):
+        env["AGENT_DESKTOP_SESSION"] = st["session"]
+    return subprocess.run([AD] + args, capture_output=capture, text=True, env=env)
+
+
+def find_bounds(obj):
+    if isinstance(obj, dict):
+        keys = obj.keys()
+        if {"x", "y", "width", "height"} <= keys:
+            return [obj["x"], obj["y"], obj["width"], obj["height"]]
+        for v in obj.values():
+            r = find_bounds(v)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = find_bounds(v)
+            if r:
+                return r
+    return None
+
+
+# ---------------------------------------------------------------- commands
+def cmd_start(argv):
+    old = load_state()
+    if old and overlay({"op": "ping"}, old):
+        fail("ADC_ALREADY_RUNNING", "adc session already running",
+             f"export AGENT_DESKTOP_SESSION={old['session']}  (or `adc stop` first)", "start")
+    want, name, nested, size, record = "new", None, False, "1600x900", None
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--nested":
+            nested = True
+            i += 1
+        elif argv[i] == "--size":
+            size = argv[i + 1]
+            i += 2
+        elif argv[i] == "--record":
+            record = argv[i + 1]
+            i += 2
+        elif argv[i] == "--desktop":
+            want = argv[i + 1]
+            i += 2
+        elif argv[i] == "--name":
+            name = argv[i + 1]
+            i += 2
+        else:
+            fail("INVALID_ARGS", f"unknown arg {argv[i]}", cmd="start")
+    cur = current_desktop()
+    if want == "new":
+        # Dynamic GNOME workspaces keep one empty workspace at the end; use it.
+        desk = num_desktops() - 1
+        if desk == cur:
+            desk = cur + 1  # moving a window there makes GNOME create it
+    else:
+        desk = int(want)
+    if desk == cur:
+        print(json.dumps({"warning": "agent desktop equals the user's current desktop"}), file=sys.stderr)
+    sargs = ["session", "start"] + (["--name", name] if name else [])
+    r = subprocess.run([AD] + sargs, capture_output=True, text=True)
+    try:
+        sid = json.loads(r.stdout)["data"]["session_id"]
+    except (ValueError, KeyError, TypeError):
+        fail("ADC_SESSION_FAILED", (r.stdout or r.stderr).strip()[:500], cmd="start")
+    os.makedirs(RUN, mode=0o700, exist_ok=True)
+    sock = os.path.join(RUN, f"{sid}.sock")
+    log = open(os.path.join(RUN, "overlay.log"), "a")
+    if nested:
+        import adc_nested as N
+        try:
+            st = N.start(RUN, sid, desk, size, record, os.path.join(HERE, "adc-overlay.py"), log)
+        except Exception as e:  # noqa: BLE001
+            subprocess.run([AD, "session", "end", sid], capture_output=True)
+            fail("ADC_NESTED_FAILED", str(e), "see $XDG_RUNTIME_DIR/adc/overlay.log", "start")
+        st.update({"session": sid, "desktop": desk, "pid": st["pids"]["overlay"], "user_desktop": cur})
+        save_state(st)
+        for _ in range(50):
+            if overlay({"op": "ping"}, st):
+                break
+            time.sleep(0.1)
+        data = {"session_id": sid, "mode": "nested", "display": st["display"], "size": st["size"],
+                "agent_desktop": desk, "user_desktop": cur, "window_manager": st["wm"],
+                "a11y_bus": bool(st["a11y_bus"]), "overlay": bool(overlay({"op": "ping"}, st)),
+                "recording": st.get("recording")}
+        if not st["wm"]:
+            data["warning"] = "no window manager (sudo apt install openbox): agent-desktop accessibility refuses windows (native_window_unproven); only see/click-xy/key/write work"
+        out({"ok": True, "command": "adc start", "data": data})
+        return
+    p = subprocess.Popen([sys.executable, "-I", os.path.join(HERE, "adc-overlay.py"),
+                          "--socket", sock, "--desktop", str(desk)],
+                         stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
+    st = {"session": sid, "desktop": desk, "socket": sock, "pid": p.pid, "user_desktop": cur}
+    save_state(st)
+    for _ in range(50):
+        if overlay({"op": "ping"}, st):
+            break
+        time.sleep(0.1)
+    ok = bool(overlay({"op": "ping"}, st))
+    out({"ok": True, "command": "adc start",
+         "data": {"session_id": sid, "agent_desktop": desk, "user_desktop": cur, "overlay": ok,
+                  "next": f"export AGENT_DESKTOP_SESSION={sid}"}})
+
+
+def cmd_stop(argv):
+    st = load_state()
+    if not st:
+        out({"ok": True, "command": "adc stop", "data": {"stopped": False}})
+        return
+    overlay({"op": "quit"}, st)
+    time.sleep(0.3)
+    rec = None
+    if st.get("mode") == "nested":
+        import adc_nested as N
+        rec = st.get("recording")
+        # close every nested app like a person (window close button) so browsers save cookies
+        try:
+            apps = json.loads(ad(["list-apps"], st).stdout)["data"]["apps"]
+            for a in apps:
+                if a.get("presentation") != "background":
+                    ad(["close-app", a["name"]], st)
+        except (ValueError, KeyError, TypeError):
+            pass
+        N.stop(st)
+    try:
+        os.kill(st["pid"], signal.SIGTERM)
+    except OSError:
+        pass
+    r = subprocess.run([AD, "session", "end", st["session"]], capture_output=True, text=True)
+    if rec:
+        print(json.dumps({"recording_saved": rec}), file=sys.stderr)
+    try:
+        os.unlink(STATE)
+    except OSError:
+        pass
+    out({"ok": True, "command": "adc stop", "data": {"session_id": st["session"], "session_end": r.returncode == 0}})
+
+
+def cmd_status(argv):
+    st = load_state()
+    out({"ok": True, "command": "adc status",
+         "data": {"state": st, "overlay": overlay({"op": "ping"}, st) if st else None,
+                  "current_desktop": current_desktop(), "desktops": num_desktops()}})
+
+
+def cmd_windows(argv):
+    st = load_state() or fail("ADC_NO_SESSION", "run `adc start` first", cmd="windows")
+    wins = [win_info(x) for x in client_list()]
+    out({"ok": True, "command": "adc windows",
+         "data": {"agent_desktop": st["desktop"], "windows": [w for w in wins if w.get("desktop") == st["desktop"]]}})
+
+
+def cmd_adopt(argv):
+    st = load_state() or fail("ADC_NO_SESSION", "run `adc start` first", cmd="adopt")
+    xids = []
+    if argv[:1] == ["--app"] and len(argv) > 1:
+        needle = argv[1].lower()
+        for x in client_list():
+            w = win_info(x)
+            if any(needle in c.lower() for c in w.get("class", [])):
+                xids.append(x)
+    elif argv:
+        xids = [int(argv[0], 0)]
+    if not xids:
+        fail("WINDOW_NOT_FOUND", "no matching X11 window", cmd="adopt")
+    for x in xids:
+        move_to_desktop(x, st["desktop"])
+    out({"ok": True, "command": "adc adopt", "data": {"moved": [hex(x) for x in xids], "agent_desktop": st["desktop"]}})
+
+
+def cmd_launch(argv):
+    st = load_state() or fail("ADC_NO_SESSION", "run `adc start` first", cmd="launch")
+    if "--activate" in argv or "--headed" in argv:
+        fail("ADC_POLICY", "--activate/--headed would steal the user's focus", cmd="launch")
+    overlay({"op": "busy", "ms": 15000}, st)
+    before = set(client_list())
+    user_active = active_window()
+    app = next((a for a in argv if not a.startswith("-")), "app")
+    sid = f"adc-{os.getpid()}-{int(time.time() * 1000)}_TIME1"  # _TIME1 = ancient user time -> no focus
+    sn_ok = False
+    try:
+        sn_ok = x11_startup_message(
+            f"new: ID={sn_quote(sid)} NAME={sn_quote(app)} SCREEN=0 DESKTOP={st['desktop']} "
+            f"BIN={sn_quote(app)} TIMESTAMP=1")
+    except OSError:
+        sn_ok = False
+    extra = ["--env", f"DESKTOP_STARTUP_ID={sid}"] if sn_ok else []
+    r = ad(["launch"] + extra + argv, st)
+    moved, deadline, first_seen, appeared_elsewhere = [], time.time() + 12, None, []
+    # Poll fast so the new window spends as little time as possible on the user's desktop.
+    while time.time() < deadline:
+        new = [x for x in client_list() if x not in before and x not in moved]
+        for x in new:
+            d = win_desktop(x)
+            if d is not None and d != st["desktop"] and d != 0xFFFFFFFF:
+                appeared_elsewhere.append(hex(x))
+            move_to_desktop(x, st["desktop"])
+            moved.append(x)
+            first_seen = first_seen or time.time()
+        if first_seen and time.time() - first_seen > 1.5:
+            break  # give the app 1.5 s for extra (splash/main) windows
+        time.sleep(0.05)
+    if sn_ok:
+        try:
+            x11_startup_message(f"remove: ID={sn_quote(sid)}")
+        except OSError:
+            pass
+    restored = False
+    if moved and user_active and active_window() in moved + [0]:
+        sh(["xdotool", "windowactivate", str(user_active)])
+        restored = True
+    try:
+        res = json.loads(r.stdout)
+    except ValueError:
+        res = {"ok": r.returncode == 0, "raw": r.stdout.strip(), "stderr": r.stderr.strip()}
+    res["adc"] = {"agent_desktop": st["desktop"], "moved_windows": [win_info(x) for x in moved],
+                  "user_focus_restored": restored, "startup_notification": sn_ok,
+                  "mapped_on_other_desktop_first": appeared_elsewhere}
+    if not moved:
+        res["adc"]["note"] = ("no new X11 window: app may be attached to an existing instance or is "
+                              "Wayland-native; use `adc adopt --app <class>` if its window sits on the user's desktop")
+    out(res)
+    sys.exit(0 if res.get("ok", r.returncode == 0) else 1)
+
+
+def passthrough(argv):
+    st = load_state()
+    allow = os.environ.get("ADC_ALLOW_PHYSICAL") == "1"
+    label = None
+    if "--adc-label" in argv:
+        i = argv.index("--adc-label")
+        label = argv[i + 1] if i + 1 < len(argv) else None
+        argv = argv[:i] + argv[i + 2:]
+    # first non-flag token is the command
+    cmd = next((a for a in argv if not a.startswith("-")), "")
+    nested = bool(st and st.get("mode") == "nested")
+    if nested:
+        allow = True  # private X server: physical input cannot reach the user
+    if not allow:
+        if "--headed" in argv:
+            fail("ADC_POLICY", "--headed uses physical input/focus and would interfere with the user",
+                 "Stay headless; if no semantic path exists, ask the user.", cmd)
+        if cmd in BLOCKED:
+            fail("ADC_POLICY", f"`{cmd}` is blocked: physical input, focus change or shared clipboard",
+                 "Use headless ref actions (click/type/set-value/select/toggle). Ask the user before lifting with ADC_ALLOW_PHYSICAL=1.", cmd)
+        if cmd == "press" and "--app" not in argv:
+            fail("ADC_POLICY", "`press` without --app types into whatever the user has focused", cmd=cmd)
+        if cmd == "launch":
+            return cmd_launch(argv[argv.index("launch") + 1:])
+    ref = next((a for a in argv if REF_RE.match(a)), None)
+    agent = os.environ.get("ADC_AGENT") or os.environ.get("AGENT_DESKTOP_AGENT_ID") or "agent"
+    rect = None
+    if st and cmd in REF_ACTIONS and ref:
+        g = ad(["get", ref, "--property", "bounds"], st)
+        try:
+            rect = find_bounds(json.loads(g.stdout).get("data"))
+        except (ValueError, AttributeError):
+            rect = None
+        if rect and rect[2] > 0 and rect[3] > 0 and nested:
+            import adc_nested as N
+            N.glide(st, lambda q: overlay(q, st), rect[0] + rect[2] / 2, rect[1] + rect[3] / 2,
+                    label or f"{agent}: {cmd}", agent)
+        elif rect and rect[2] > 0 and rect[3] > 0:
+            cx, cy = rect[0] + rect[2] / 2, rect[1] + rect[3] / 2
+            resp = overlay({"op": "move", "agent": agent, "x": cx, "y": cy,
+                            "label": label or f"{agent}: {cmd}"}, st)
+            if resp and resp.get("ms"):
+                time.sleep(resp["ms"] / 1000 + 0.04)
+    if st and cmd in ("snapshot", "find", "get", "is", "wait", "list-surfaces"):
+        overlay({"op": "think", "agent": agent, "ms": 1200}, st)
+    if st and not nested:
+        overlay({"op": "busy", "ms": 4000}, st)
+    r = ad(argv, st, capture=False)
+    if st and rect and r.returncode == 0:
+        cx, cy = rect[0] + rect[2] / 2, rect[1] + rect[3] / 2
+        overlay({"op": "type" if cmd in TYPE_ACTIONS else "click", "agent": agent,
+                 "x": cx, "y": cy, "rect": rect}, st)
+    sys.exit(r.returncode)
+
+
+# ---------------------------------------------------------------- nested "human" commands
+HUMAN = {"see", "click-xy", "double-xy", "right-xy", "move", "drag-xy", "key", "write", "scroll-xy",
+         "browser", "run", "record", "wait-idle", "ask-user", "focus"}
+
+
+def _opts(argv, flags):
+    """tiny parser: returns (positional, {flag: value}); flags map name->takes_value"""
+    pos, kv, i = [], {}, 0
+    while i < len(argv):
+        a = argv[i]
+        if a in flags:
+            if flags[a]:
+                kv[a] = argv[i + 1]
+                i += 2
+            else:
+                kv[a] = True
+                i += 1
+        else:
+            pos.append(a)
+            i += 1
+    return pos, kv
+
+
+def videos_dir():
+    try:
+        d = subprocess.run(["xdg-user-dir", "VIDEOS"], capture_output=True, text=True).stdout.strip()
+    except OSError:
+        d = ""
+    return d or os.path.expanduser("~/Videos")
+
+
+def cmd_human(name, argv):
+    st = load_state()
+    if not st or st.get("mode") != "nested":
+        fail("ADC_NOT_NESTED", f"`{name}` needs a nested session", "adc start --nested", name)
+    import adc_nested as N
+    ov = lambda q: overlay(q, st)  # noqa: E731
+    agent = os.environ.get("ADC_AGENT") or "agent"
+    pos, kv = _opts(argv, {"--label": True, "--out": True, "--scale": True, "--grid": True, "--region": True,
+                           "--profile": True, "--mods": True, "--delay": True, "--real-dbus": False,
+                           "--target": True, "--name": True, "--title": True, "--timeout": True})
+    label = kv.get("--label")
+    data = {}
+    try:
+        if name == "see":
+            outp = kv.get("--out") or os.path.join(RUN, f"see-{int(time.time() * 1000)}.png")
+            region = [int(v) for v in kv["--region"].split(",")] if "--region" in kv else None
+            data = N.see(st, outp, float(kv.get("--scale", 0.5)), int(kv.get("--grid", 100)), region)
+        elif name in ("click-xy", "double-xy", "right-xy"):
+            x, y = int(float(pos[0])), int(float(pos[1]))
+            mods = kv["--mods"].split("+") if "--mods" in kv else ()
+            N.click(st, ov, x, y, 3 if name == "right-xy" else 1, 2 if name == "double-xy" else 1,
+                    label, agent, mods)
+            data = {"x": x, "y": y}
+        elif name == "move":
+            N.glide(st, ov, int(float(pos[0])), int(float(pos[1])), label, agent)
+        elif name == "drag-xy":
+            x1, y1, x2, y2 = (int(float(v)) for v in pos[:4])
+            N.drag(st, ov, x1, y1, x2, y2, label, agent)
+        elif name == "key":
+            data["focused"] = N.focus(st, kv.get("--target"))
+            for combo in pos:
+                N.key(st, ov, combo, label, agent)
+        elif name == "write":
+            data["focused"] = N.focus(st, kv.get("--target"))
+            N.write(st, ov, " ".join(pos), label, agent, int(kv.get("--delay", 45)))
+        elif name == "focus":
+            data["focused"] = N.focus(st, pos[0] if pos else kv.get("--target"))
+        elif name == "ask-user":
+            data = N.ask_user(st, ov, " ".join(pos) or "Please sign in so the agent can continue.",
+                              kv.get("--title"), int(kv.get("--timeout", 900)))
+        elif name == "scroll-xy":
+            N.scroll(st, ov, int(float(pos[0])), int(float(pos[1])), pos[2], int(pos[3]) if len(pos) > 3 else 3, agent)
+        elif name == "browser":
+            log = open(os.path.join(RUN, "apps.log"), "a")
+            pid, udd = N.browser(st, RUN, pos[0] if pos else "about:blank", kv.get("--profile"), log,
+                                 kv.get("--name"))
+            save_state(st)
+            data = {"pid": pid, "user_data_dir": udd, "app_name_hint": "chrome"}
+        elif name == "run":
+            log = open(os.path.join(RUN, "apps.log"), "a")
+            pid = N.launch(st, pos, log, real_dbus=bool(kv.get("--real-dbus")))
+            save_state(st)
+            data = {"pid": pid}
+        elif name == "record":
+            if pos[:1] == ["start"]:
+                data = N.record_start(st, pos[1] if len(pos) > 1 else os.path.expanduser(
+                    videos_dir() + f"/adc-{time.strftime('%Y%m%d-%H%M%S')}.mp4"), open(os.path.join(RUN, "overlay.log"), "a"))
+            else:
+                data = N.record_stop(st)
+            save_state(st)
+        elif name == "wait-idle":
+            time.sleep(float(pos[0]) / 1000 if pos else 0.5)
+    except (IndexError, ValueError) as e:
+        fail("INVALID_ARGS", f"{name}: {e}", "adc --help", name)
+    except Exception as e:  # noqa: BLE001
+        fail("ACTION_FAILED", f"{name}: {e}", cmd=name)
+    out({"ok": True, "command": f"adc {name}", "data": data})
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    if os.environ.get("XDG_SESSION_TYPE", "x11") != "x11" or not os.environ.get("DISPLAY"):
+        if argv[0] in ("start", "launch", "adopt", "windows"):
+            fail("PLATFORM_NOT_SUPPORTED", "adc workspace isolation and overlay need an X11 session", cmd=argv[0])
+    table = {"start": cmd_start, "stop": cmd_stop, "status": cmd_status, "windows": cmd_windows,
+             "adopt": cmd_adopt}
+    if argv[0] in table:
+        return table[argv[0]](argv[1:])
+    if argv[0] in HUMAN:
+        return cmd_human(argv[0], argv[1:])
+    return passthrough(argv)
+
+
+if __name__ == "__main__":
+    main()
