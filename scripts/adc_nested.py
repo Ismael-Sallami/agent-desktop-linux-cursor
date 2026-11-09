@@ -5,10 +5,9 @@ Isolation:
     it straight onto the agent workspace without focus (no flash, no focus steal);
   * private X server  -> own pointer, keyboard focus, clipboard/selections;
   * private D-Bus session + private AT-SPI bus -> single-instance apps and notifications cannot
-    leak onto the user's desktop; agent-desktop only sees the agent's apps;
-  * physical input (xdotool, agent-desktop --headed) only touches the nested display.
+    leak onto the user's desktop; the accessibility engine only sees the agent's apps;
+  * physical input (xdotool) only touches the nested display.
 """
-import json
 import math
 import os
 import re
@@ -132,9 +131,14 @@ def start(st_dir, sid, desk, size, record, overlay_py, log):
     else:
         raise RuntimeError("Xephyr did not come up (see overlay.log)")
     # private session bus
+    # The bus inherits DISPLAY=<nested>: at-spi-bus-launcher names its socket after the display
+    # ($XDG_RUNTIME_DIR/at-spi/bus_<n>). With the user's DISPLAY it would replace the user's own
+    # accessibility socket. dconf-service inherits the isolated XDG directories.
+    denv = xdg_env(dict(os.environ, DISPLAY=disp))
+    denv.pop("AT_SPI_BUS_ADDRESS", None)
     out = subprocess.run(["dbus-daemon", f"--config-file={dbus_config(st_dir, sid)}", "--fork",
                           "--print-address=1", "--print-pid=1"], capture_output=True, text=True,
-                         env=xdg_env(dict(os.environ))).stdout.split()  # dconf-service inherits isolated XDG
+                         env=denv).stdout.split()
     st["dbus"], st["pids"]["dbus"] = out[0], int(out[1])
     env = dict(os.environ, DISPLAY=disp, DBUS_SESSION_BUS_ADDRESS=st["dbus"])
     env.pop("AT_SPI_BUS_ADDRESS", None)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""adc: agent-desktop wrapper for Linux X11 with a visual agent cursor on its own workspace.
+"""adc: an isolated Linux (X11) desktop for AI agents, with a visible agent cursor on its own workspace.
 
 Guarantees (unless ADC_ALLOW_PHYSICAL=1):
   * never moves the real pointer, never sends physical keys/mouse, never takes focus,
@@ -11,10 +11,16 @@ Usage:
   adc start [--desktop N|new] [--name NAME]   start session + overlay (prints export line)
   adc stop                                    end session, kill overlay
   adc status                                  state + overlay ping
-  adc launch APP [agent-desktop launch args]  launch, move windows to agent desktop
+  adc launch APP [ARGS...]                    launch an app, move its windows to the agent desktop
   adc windows                                 X11 windows on the agent desktop
   adc adopt <xid|--app NAME>                  move an existing window to the agent desktop
-  adc <any agent-desktop command ...>         pass-through; ref actions animate the cursor
+Accessibility (built-in AT-SPI engine, both modes; ref actions animate the cursor):
+  adc list-apps | snapshot [--app A] [--window T] [-i] [--compact]
+  adc find [--app A] [--role R] [--name N] | wait ... [--gone] [--timeout ms] | get REF | is REF STATE
+  adc click|right-click|focus|scroll-to|toggle|check|uncheck|expand|collapse REF
+  adc type REF TEXT | set-value REF TEXT | clear REF | select REF OPTION | close-app NAME [--force]
+  adc doctor                                  check dependencies (prints the apt install line)
+  adc version
 Nested mode (private X server on the agent workspace; physical input allowed, never reaches the user):
   adc start --nested [--size 1600x900] [--record FILE.mp4] [--desktop N]
   adc see [--scale 0.5] [--grid 100] [--region x,y,w,h] [--out F]   screenshot + coordinate grid
@@ -27,10 +33,9 @@ Nested mode (private X server on the agent workspace; physical input allowed, ne
   adc browser URL [--name linkedin]          persistent agent browser profile (log in once)
   adc ask-user "Please sign in to LinkedIn" [--title T] [--timeout s]   system notification, user hands off
   adc key/write ... [--target "window title"] -> data.focused = window that received the input
-Extra flags (stripped before agent-desktop sees them):
-  --adc-label "text"   label shown on the cursor for this action
-Env: ADC_AGENT (cursor id / colour; also forwarded as --agent-id if AGENT_DESKTOP_AGENT_ID set),
-     ADC_ALLOW_PHYSICAL=1 to lift the policy (only with the user's explicit OK).
+Extra flags: --label "text" / --adc-label "text"   label shown on the agent cursor for this action
+Env: ADC_AGENT (cursor id / colour), ADC_ALLOW_PHYSICAL=1 to lift the shared-mode policy
+     (only with the user's explicit OK), ADC_LANG (en|es) for hand-off notifications.
 """
 import json
 import os
@@ -43,19 +48,25 @@ import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
-RUN = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/adc-{os.getuid()}"), "adc")
+try:
+    import adc_pro as PRO  # optional Pro plugin (scripts/adc_pro.py)
+except ImportError:
+    PRO = None
+
+VERSION = "2.0.0"
+BASE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/adc-{os.getuid()}"), "adc")
+SESSION = re.sub(r"[^\w.-]", "_", os.environ.get("ADC_SESSION", "default")) or "default"
+RUN = BASE if SESSION == "default" else os.path.join(BASE, "sessions", SESSION)
 STATE = os.path.join(RUN, "state.json")
-AD = os.environ.get("ADC_AGENT_DESKTOP_BIN", "agent-desktop")
+ENGINE = os.path.join(HERE, "adc_a11y.py")
 REF_RE = re.compile(r"^@[A-Za-z0-9]+:e\d+$")
 
+ENGINE_CMDS = {"list-apps", "snapshot", "find", "wait", "get", "is", "click", "right-click", "focus",
+               "scroll-to", "toggle", "check", "uncheck", "expand", "collapse", "type", "set-value",
+               "clear", "select", "close-app"}
 REF_ACTIONS = {"click", "right-click", "type", "set-value", "clear", "select", "toggle", "check",
                "uncheck", "expand", "collapse", "scroll-to", "focus"}
 TYPE_ACTIONS = {"type", "set-value", "clear"}
-# Physical input, focus stealing, shared clipboard, shell UI the user is looking at.
-BLOCKED = {"focus-window", "hover", "drag", "double-click", "triple-click", "mouse-move", "mouse-click",
-           "mouse-down", "mouse-up", "mouse-wheel", "scroll", "key-down", "key-up", "clipboard-get",
-           "clipboard-set", "clipboard-clear", "open-system-surface", "dismiss-notification",
-           "dismiss-all-notifications", "notification-action", "cursor-overlay", "focus"}
 
 
 def out(obj):
@@ -228,40 +239,38 @@ def overlay(req, st=None):
         return None
 
 
-def ad(args, st=None, capture=True):
+def engine_env(st):
     env = dict(os.environ)
-    st = st or load_state()
     if st and st.get("mode") == "nested":
         import adc_nested as N
         env = N.nenv(st)
-    if st and not env.get("AGENT_DESKTOP_SESSION"):
-        env["AGENT_DESKTOP_SESSION"] = st["session"]
-    return subprocess.run([AD] + args, capture_output=capture, text=True, env=env)
+    env["ADC_STATE_DIR"] = RUN
+    return env
 
 
-def find_bounds(obj):
-    if isinstance(obj, dict):
-        keys = obj.keys()
-        if {"x", "y", "width", "height"} <= keys:
-            return [obj["x"], obj["y"], obj["width"], obj["height"]]
-        for v in obj.values():
-            r = find_bounds(v)
-            if r:
-                return r
-    elif isinstance(obj, list):
-        for v in obj:
-            r = find_bounds(v)
-            if r:
-                return r
-    return None
+def eng(args, st=None, timeout=120):
+    """Run the accessibility engine against the session's display; returns the parsed JSON."""
+    st = st or load_state()
+    try:
+        r = subprocess.run([sys.executable, "-I", ENGINE] + list(args), capture_output=True, text=True,
+                           env=engine_env(st), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "command": args[0] if args else "", "error": {"code": "TIMEOUT",
+                "message": "accessibility engine timed out (application not responding)"}}
+    try:
+        return json.loads(r.stdout)
+    except ValueError:
+        return {"ok": False, "command": args[0] if args else "",
+                "error": {"code": "INTERNAL", "message": (r.stderr or r.stdout).strip()[-800:]}}
 
 
 # ---------------------------------------------------------------- commands
 def cmd_start(argv):
     old = load_state()
     if old and overlay({"op": "ping"}, old):
-        fail("ADC_ALREADY_RUNNING", "adc session already running",
-             f"export AGENT_DESKTOP_SESSION={old['session']}  (or `adc stop` first)", "start")
+        fail("ADC_ALREADY_RUNNING", f"adc session {SESSION!r} already running ({old['session']})",
+             "reuse it, run `adc stop` first" + (", or set ADC_SESSION=<name> for a parallel one" if PRO else ""),
+             "start")
     want, name, nested, size, record = "new", None, False, "1600x900", None
     i = 0
     while i < len(argv):
@@ -292,13 +301,16 @@ def cmd_start(argv):
         desk = int(want)
     if desk == cur:
         print(json.dumps({"warning": "agent desktop equals the user's current desktop"}), file=sys.stderr)
-    sargs = ["session", "start"] + (["--name", name] if name else [])
-    r = subprocess.run([AD] + sargs, capture_output=True, text=True)
-    try:
-        sid = json.loads(r.stdout)["data"]["session_id"]
-    except (ValueError, KeyError, TypeError):
-        fail("ADC_SESSION_FAILED", (r.stdout or r.stderr).strip()[:500], cmd="start")
+    if SESSION != "default" and not PRO:
+        fail("ADC_PRO_FEATURE", "parallel named sessions (ADC_SESSION) are part of adc Pro",
+             "unset ADC_SESSION to use the single default session", "start")
+    import secrets
+    sid = (re.sub(r"[^\w-]", "", name or "") or "adc") + "-" + secrets.token_hex(3)
     os.makedirs(RUN, mode=0o700, exist_ok=True)
+    try:
+        os.unlink(os.path.join(RUN, "refs.json"))
+    except OSError:
+        pass
     sock = os.path.join(RUN, f"{sid}.sock")
     log = open(os.path.join(RUN, "overlay.log"), "a")
     if nested:
@@ -306,9 +318,9 @@ def cmd_start(argv):
         try:
             st = N.start(RUN, sid, desk, size, record, os.path.join(HERE, "adc-overlay.py"), log)
         except Exception as e:  # noqa: BLE001
-            subprocess.run([AD, "session", "end", sid], capture_output=True)
             fail("ADC_NESTED_FAILED", str(e), "see $XDG_RUNTIME_DIR/adc/overlay.log", "start")
-        st.update({"session": sid, "desktop": desk, "pid": st["pids"]["overlay"], "user_desktop": cur})
+        st.update({"session": sid, "desktop": desk, "pid": st["pids"]["overlay"], "user_desktop": cur,
+                   "started": time.time(), "name": SESSION})
         save_state(st)
         for _ in range(50):
             if overlay({"op": "ping"}, st):
@@ -317,15 +329,16 @@ def cmd_start(argv):
         data = {"session_id": sid, "mode": "nested", "display": st["display"], "size": st["size"],
                 "agent_desktop": desk, "user_desktop": cur, "window_manager": st["wm"],
                 "a11y_bus": bool(st["a11y_bus"]), "overlay": bool(overlay({"op": "ping"}, st)),
-                "recording": st.get("recording")}
+                "recording": st.get("recording"), "adc_session": SESSION, "pro": bool(PRO)}
         if not st["wm"]:
-            data["warning"] = "no window manager (sudo apt install openbox): agent-desktop accessibility refuses windows (native_window_unproven); only see/click-xy/key/write work"
+            data["warning"] = "no window manager (sudo apt install openbox): windows cannot be focused or closed gracefully"
         out({"ok": True, "command": "adc start", "data": data})
         return
     p = subprocess.Popen([sys.executable, "-I", os.path.join(HERE, "adc-overlay.py"),
                           "--socket", sock, "--desktop", str(desk)],
                          stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
-    st = {"session": sid, "desktop": desk, "socket": sock, "pid": p.pid, "user_desktop": cur}
+    st = {"session": sid, "desktop": desk, "socket": sock, "pid": p.pid, "user_desktop": cur, "mode": "shared",
+          "started": time.time(), "name": SESSION}
     save_state(st)
     for _ in range(50):
         if overlay({"op": "ping"}, st):
@@ -333,8 +346,8 @@ def cmd_start(argv):
         time.sleep(0.1)
     ok = bool(overlay({"op": "ping"}, st))
     out({"ok": True, "command": "adc start",
-         "data": {"session_id": sid, "agent_desktop": desk, "user_desktop": cur, "overlay": ok,
-                  "next": f"export AGENT_DESKTOP_SESSION={sid}"}})
+         "data": {"session_id": sid, "mode": "shared", "agent_desktop": desk, "user_desktop": cur, "overlay": ok,
+                  "adc_session": SESSION, "pro": bool(PRO)}})
 
 
 def cmd_stop(argv):
@@ -350,25 +363,25 @@ def cmd_stop(argv):
         rec = st.get("recording")
         # close every nested app like a person (window close button) so browsers save cookies
         try:
-            apps = json.loads(ad(["list-apps"], st).stdout)["data"]["apps"]
-            for a in apps:
+            for a in eng(["list-apps"], st, timeout=20)["data"]["apps"]:
                 if a.get("presentation") != "background":
-                    ad(["close-app", a["name"]], st)
-        except (ValueError, KeyError, TypeError):
+                    eng(["close-app", a["name"], "--timeout", "6"], st, timeout=30)
+        except (KeyError, TypeError):
             pass
         N.stop(st)
     try:
         os.kill(st["pid"], signal.SIGTERM)
     except OSError:
         pass
-    r = subprocess.run([AD, "session", "end", st["session"]], capture_output=True, text=True)
+    if PRO and hasattr(PRO, "on_stop"):
+        PRO.on_stop(sys.modules[__name__], st)
     if rec:
         print(json.dumps({"recording_saved": rec}), file=sys.stderr)
     try:
         os.unlink(STATE)
     except OSError:
         pass
-    out({"ok": True, "command": "adc stop", "data": {"session_id": st["session"], "session_end": r.returncode == 0}})
+    out({"ok": True, "command": "adc stop", "data": {"session_id": st["session"], "recording": rec}})
 
 
 def cmd_status(argv):
@@ -405,12 +418,14 @@ def cmd_adopt(argv):
 
 def cmd_launch(argv):
     st = load_state() or fail("ADC_NO_SESSION", "run `adc start` first", cmd="launch")
-    if "--activate" in argv or "--headed" in argv:
-        fail("ADC_POLICY", "--activate/--headed would steal the user's focus", cmd="launch")
+    if not argv:
+        fail("INVALID_ARGS", "launch needs an application", cmd="launch")
+    if st.get("mode") == "nested":  # same as `adc run` on the private display
+        return cmd_human("run", argv)
     overlay({"op": "busy", "ms": 15000}, st)
     before = set(client_list())
     user_active = active_window()
-    app = next((a for a in argv if not a.startswith("-")), "app")
+    app = os.path.basename(argv[0])
     sid = f"adc-{os.getpid()}-{int(time.time() * 1000)}_TIME1"  # _TIME1 = ancient user time -> no focus
     sn_ok = False
     try:
@@ -419,8 +434,17 @@ def cmd_launch(argv):
             f"BIN={sn_quote(app)} TIMESTAMP=1")
     except OSError:
         sn_ok = False
-    extra = ["--env", f"DESKTOP_STARTUP_ID={sid}"] if sn_ok else []
-    r = ad(["launch"] + extra + argv, st)
+    env = dict(os.environ, GTK_MODULES="gail:atk-bridge", NO_AT_BRIDGE="0", ACCESSIBILITY_ENABLED="1",
+               QT_LINUX_ACCESSIBILITY_ALWAYS_ON="1")
+    if sn_ok:
+        env["DESKTOP_STARTUP_ID"] = sid
+    try:
+        proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        fail("LAUNCH_FAILED", str(e), cmd="launch")
+    st.setdefault("apps", []).append(proc.pid)
+    save_state(st)
     moved, deadline, first_seen, appeared_elsewhere = [], time.time() + 12, None, []
     # Poll fast so the new window spends as little time as possible on the user's desktop.
     while time.time() < deadline:
@@ -444,73 +468,125 @@ def cmd_launch(argv):
     if moved and user_active and active_window() in moved + [0]:
         sh(["xdotool", "windowactivate", str(user_active)])
         restored = True
-    try:
-        res = json.loads(r.stdout)
-    except ValueError:
-        res = {"ok": r.returncode == 0, "raw": r.stdout.strip(), "stderr": r.stderr.strip()}
-    res["adc"] = {"agent_desktop": st["desktop"], "moved_windows": [win_info(x) for x in moved],
-                  "user_focus_restored": restored, "startup_notification": sn_ok,
-                  "mapped_on_other_desktop_first": appeared_elsewhere}
+    data = {"pid": proc.pid, "agent_desktop": st["desktop"], "moved_windows": [win_info(x) for x in moved],
+            "user_focus_restored": restored, "startup_notification": sn_ok,
+            "mapped_on_other_desktop_first": appeared_elsewhere}
     if not moved:
-        res["adc"]["note"] = ("no new X11 window: app may be attached to an existing instance or is "
-                              "Wayland-native; use `adc adopt --app <class>` if its window sits on the user's desktop")
-    out(res)
-    sys.exit(0 if res.get("ok", r.returncode == 0) else 1)
+        data["note"] = ("no new X11 window: app may be attached to an existing instance or is "
+                        "Wayland-native; use `adc adopt --app <class>` if its window sits on the user's desktop")
+    out({"ok": True, "command": "adc launch", "data": data})
 
 
-def passthrough(argv):
-    st = load_state()
-    allow = os.environ.get("ADC_ALLOW_PHYSICAL") == "1"
+def _on_screen(rect, st):
+    if not rect:
+        return False
+    w, h = st.get("size") or (10 ** 5, 10 ** 5)
+    cx, cy = rect[0] + rect[2] / 2, rect[1] + rect[3] / 2
+    return 0 <= cx < w and 0 <= cy < h
+
+
+def _center(rect):
+    return rect[0] + rect[2] / 2, rect[1] + rect[3] / 2
+
+
+def _pop_label(argv):
     label = None
-    if "--adc-label" in argv:
-        i = argv.index("--adc-label")
-        label = argv[i + 1] if i + 1 < len(argv) else None
-        argv = argv[:i] + argv[i + 2:]
-    # first non-flag token is the command
-    cmd = next((a for a in argv if not a.startswith("-")), "")
+    for flag in ("--adc-label", "--label"):
+        if flag in argv:
+            i = argv.index(flag)
+            label = argv[i + 1] if i + 1 < len(argv) else None
+            argv = argv[:i] + argv[i + 2:]
+    return argv, label
+
+
+def accessibility(argv):
+    """Built-in AT-SPI engine. Nested mode moves the real pointer onto the element first and types
+    with the real keyboard (so web pages receive genuine input events); shared mode stays headless."""
+    st = load_state()
+    argv, label = _pop_label(argv)
+    cmd = argv[0]
     nested = bool(st and st.get("mode") == "nested")
-    if nested:
-        allow = True  # private X server: physical input cannot reach the user
-    if not allow:
-        if "--headed" in argv:
-            fail("ADC_POLICY", "--headed uses physical input/focus and would interfere with the user",
-                 "Stay headless; if no semantic path exists, ask the user.", cmd)
-        if cmd in BLOCKED:
-            fail("ADC_POLICY", f"`{cmd}` is blocked: physical input, focus change or shared clipboard",
-                 "Use headless ref actions (click/type/set-value/select/toggle). Ask the user before lifting with ADC_ALLOW_PHYSICAL=1.", cmd)
-        if cmd == "press" and "--app" not in argv:
-            fail("ADC_POLICY", "`press` without --app types into whatever the user has focused", cmd=cmd)
-        if cmd == "launch":
-            return cmd_launch(argv[argv.index("launch") + 1:])
-    ref = next((a for a in argv if REF_RE.match(a)), None)
-    agent = os.environ.get("ADC_AGENT") or os.environ.get("AGENT_DESKTOP_AGENT_ID") or "agent"
-    rect = None
-    if st and cmd in REF_ACTIONS and ref:
-        g = ad(["get", ref, "--property", "bounds"], st)
-        try:
-            rect = find_bounds(json.loads(g.stdout).get("data"))
-        except (ValueError, AttributeError):
-            rect = None
-        if rect and rect[2] > 0 and rect[3] > 0 and nested:
-            import adc_nested as N
-            N.glide(st, lambda q: overlay(q, st), rect[0] + rect[2] / 2, rect[1] + rect[3] / 2,
-                    label or f"{agent}: {cmd}", agent)
-        elif rect and rect[2] > 0 and rect[3] > 0:
-            cx, cy = rect[0] + rect[2] / 2, rect[1] + rect[3] / 2
-            resp = overlay({"op": "move", "agent": agent, "x": cx, "y": cy,
-                            "label": label or f"{agent}: {cmd}"}, st)
-            if resp and resp.get("ms"):
-                time.sleep(resp["ms"] / 1000 + 0.04)
-    if st and cmd in ("snapshot", "find", "get", "is", "wait", "list-surfaces"):
+    agent = os.environ.get("ADC_AGENT") or "agent"
+    if PRO and hasattr(PRO, "before"):
+        argv = PRO.before(sys.modules[__name__], cmd, argv, st) or argv
+    ref = next((a for a in argv[1:] if REF_RE.match(a)), None)
+    if st and cmd in ("snapshot", "find", "get", "is", "wait", "list-apps"):
         overlay({"op": "think", "agent": agent, "ms": 1200}, st)
+    rect = None
+    if st and ref and cmd in REF_ACTIONS:
+        g = eng(["get", ref, "--property", "bounds"], st)
+        if not g.get("ok"):
+            out(g)
+            sys.exit(1)
+        rect = (g.get("data") or {}).get("bounds")
+        if nested and rect and cmd != "scroll-to" and not _on_screen(rect, st):
+            s = eng(["scroll-to", ref], st)  # bring off-screen elements into view first
+            rect = (s.get("data") or {}).get("bounds") if s.get("ok") else rect
+            if not _on_screen(rect, st):
+                rect = None
+        if rect and rect[2] > 0 and rect[3] > 0 and (not nested or _on_screen(rect, st)):
+            cx, cy = _center(rect)
+            if nested:
+                import adc_nested as N
+                N.glide(st, lambda q: overlay(q, st), cx, cy, label or f"{agent}: {cmd}", agent)
+            else:
+                resp = overlay({"op": "move", "agent": agent, "x": cx, "y": cy,
+                                "label": label or f"{agent}: {cmd}"}, st)
+                if resp and resp.get("ms"):
+                    time.sleep(resp["ms"] / 1000 + 0.04)
+        else:
+            rect = None
     if st and not nested:
         overlay({"op": "busy", "ms": 4000}, st)
-    r = ad(argv, st, capture=False)
-    if st and rect and r.returncode == 0:
-        cx, cy = rect[0] + rect[2] / 2, rect[1] + rect[3] / 2
-        overlay({"op": "type" if cmd in TYPE_ACTIONS else "click", "agent": agent,
-                 "x": cx, "y": cy, "rect": rect}, st)
-    sys.exit(r.returncode)
+    if nested and rect and cmd in TYPE_ACTIONS:
+        res = _nested_type(st, cmd, argv, rect, agent)
+    else:
+        res = eng(argv, st)
+        if nested and rect and not res.get("ok") and res.get("error", {}).get("code") == "ACTION_UNSUPPORTED" \
+                and cmd in ("click", "right-click", "focus", "toggle", "check", "uncheck", "expand", "collapse"):
+            import adc_nested as N
+            cx, cy = _center(rect)
+            N.click(st, lambda q: overlay(q, st), int(cx), int(cy), 3 if cmd == "right-click" else 1, 1,
+                    None, agent)
+            res = {"ok": True, "command": cmd, "data": {"action": "physical-click", "bounds": rect}}
+    if nested and cmd == "select" and res.get("ok") and (res.get("data") or {}).get("popup_open"):
+        import adc_nested as N
+        N.key(st, lambda q: overlay(q, st), "Escape")  # a dropdown left open keeps the keyboard grabbed
+        res["data"]["popup_open"] = False
+    if st and rect and res.get("ok"):
+        cx, cy = _center(rect)
+        overlay({"op": "type" if cmd in TYPE_ACTIONS else "click", "agent": agent, "x": cx, "y": cy,
+                 "rect": rect}, st)
+    if PRO and hasattr(PRO, "after"):
+        PRO.after(sys.modules[__name__], cmd, argv, st, res)
+    out(res)
+    sys.exit(0 if res.get("ok") else 1)
+
+
+def _nested_type(st, cmd, argv, rect, agent):
+    """Real keyboard input into an element of the private display: click it, optionally select all
+    and delete, then type. Reads the text back through accessibility when possible."""
+    import adc_nested as N
+    ov = lambda q: overlay(q, st)  # noqa: E731
+    text = " ".join(a for a in argv[2:]) if cmd != "clear" else ""
+    cx, cy = _center(rect)
+    focused = eng(["focus", argv[1]], st)
+    if not (focused.get("ok") and focused["data"].get("focused")):
+        N.click(st, ov, int(cx), int(cy), 1, 1, None, agent)
+    time.sleep(0.1)
+    if cmd in ("set-value", "clear"):
+        N.key(st, ov, "ctrl+a")
+        N.key(st, ov, "BackSpace")
+    else:
+        N.key(st, ov, "End")
+    if text:
+        N.write(st, ov, text, None, agent)
+    time.sleep(0.15)
+    g = eng(["get", argv[1], "--property", "text"], st)
+    data = {"typed": text, "bounds": rect, "via": "keyboard"}
+    if g.get("ok"):
+        data["text"] = g["data"].get("text")
+    return {"ok": True, "command": cmd, "data": data}
 
 
 # ---------------------------------------------------------------- nested "human" commands
@@ -556,6 +632,13 @@ def cmd_human(name, argv):
                            "--target": True, "--name": True, "--title": True, "--timeout": True})
     label = kv.get("--label")
     data = {}
+    if PRO and hasattr(PRO, "before"):
+        new = PRO.before(sys.modules[__name__], name, [name] + argv, st)
+        if new:
+            pos, kv = _opts(new[1:], {"--label": True, "--out": True, "--scale": True, "--grid": True,
+                                      "--region": True, "--profile": True, "--mods": True, "--delay": True,
+                                      "--real-dbus": False, "--target": True, "--name": True, "--title": True,
+                                      "--timeout": True})
     try:
         if name == "see":
             outp = kv.get("--out") or os.path.join(RUN, f"see-{int(time.time() * 1000)}.png")
@@ -610,7 +693,50 @@ def cmd_human(name, argv):
         fail("INVALID_ARGS", f"{name}: {e}", "adc --help", name)
     except Exception as e:  # noqa: BLE001
         fail("ACTION_FAILED", f"{name}: {e}", cmd=name)
-    out({"ok": True, "command": f"adc {name}", "data": data})
+    res = {"ok": True, "command": f"adc {name}", "data": data}
+    if PRO and hasattr(PRO, "after"):
+        PRO.after(sys.modules[__name__], name, [name] + argv, st, res)
+    out(res)
+
+
+DEPS = [  # (binary, apt package, needed for)
+    ("Xephyr", "xserver-xephyr", "nested mode"), ("openbox", "openbox", "nested window manager"),
+    ("picom", "picom", "agent cursor transparency"), ("xdotool", "xdotool", "input and windows"),
+    ("xprop", "x11-utils", "workspace control"), ("xdpyinfo", "x11-utils", "display checks"),
+    ("xsetroot", "x11-xserver-utils", "nested background"), ("setxkbmap", "x11-xkb-utils", "keyboard layout"),
+    ("wmctrl", "wmctrl", "graceful window close"), ("xclip", "xclip", "unicode typing"),
+    ("import", "imagemagick", "screenshots"), ("convert", "imagemagick", "screenshot grid"),
+    ("ffmpeg", "ffmpeg", "recording"), ("notify-send", "libnotify-bin", "ask-user hand-off"),
+    ("dbus-daemon", "dbus", "private session bus"), ("dbus-send", "dbus", "accessibility bus"),
+]
+
+
+def cmd_doctor(argv):
+    import shutil
+    missing, checks = [], []
+    for b, pkg, why in DEPS:
+        ok = bool(shutil.which(b))
+        checks.append({"binary": b, "ok": ok, "for": why})
+        if not ok and pkg not in missing:
+            missing.append(pkg)
+    chrome = shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser")
+    r = subprocess.run([sys.executable, "-I", "-c", "import gi;gi.require_version('Atspi','2.0');"
+                        "gi.require_version('Gtk','3.0');from gi.repository import Atspi,Gtk"],
+                       capture_output=True, text=True)
+    gi_ok = r.returncode == 0
+    if not gi_ok:
+        missing += ["python3-gi", "gir1.2-atspi-2.0", "gir1.2-gtk-3.0"]
+    session = os.environ.get("XDG_SESSION_TYPE", "unknown")
+    data = {"version": VERSION, "pro": bool(PRO), "x11": session == "x11" and bool(os.environ.get("DISPLAY")),
+            "session_type": session, "python_gi_atspi_gtk": gi_ok, "browser": chrome, "checks": checks,
+            "missing_packages": missing}
+    if missing:
+        data["install"] = "sudo apt install " + " ".join(missing)
+    if session != "x11":
+        data["warning"] = "adc needs an X11 session (log in with 'Ubuntu on Xorg')"
+    if PRO and hasattr(PRO, "doctor"):
+        data["pro_checks"] = PRO.doctor(sys.modules[__name__])
+    out({"ok": not missing and data["x11"], "command": "adc doctor", "data": data})
 
 
 def main():
@@ -622,12 +748,40 @@ def main():
         if argv[0] in ("start", "launch", "adopt", "windows"):
             fail("PLATFORM_NOT_SUPPORTED", "adc workspace isolation and overlay need an X11 session", cmd=argv[0])
     table = {"start": cmd_start, "stop": cmd_stop, "status": cmd_status, "windows": cmd_windows,
-             "adopt": cmd_adopt}
+             "adopt": cmd_adopt, "doctor": cmd_doctor}
+    if argv[0] in ("version", "--version"):
+        return out({"ok": True, "command": "adc version", "data": {"version": VERSION, "pro": bool(PRO),
+                    "pro_version": getattr(PRO, "VERSION", None)}})
+    if argv[0] == "launch":
+        return cmd_launch(argv[1:])
     if argv[0] in table:
         return table[argv[0]](argv[1:])
+    if PRO and argv[0] in getattr(PRO, "COMMANDS", {}):
+        return PRO.COMMANDS[argv[0]](sys.modules[__name__], argv[1:])
+    if argv[0] == "focus" and any(REF_RE.match(a) for a in argv[1:]):
+        return _shared_policy(argv) or accessibility(argv)
     if argv[0] in HUMAN:
         return cmd_human(argv[0], argv[1:])
-    return passthrough(argv)
+    if argv[0] in ENGINE_CMDS:
+        return _shared_policy(argv) or accessibility(argv)
+    hint = "adc --help"
+    if PRO is None and argv[0] in PRO_ONLY:
+        fail("ADC_PRO_FEATURE", f"`{argv[0]}` is part of adc Pro", "https://www.agensi.io (adc Pro)", argv[0])
+    fail("UNKNOWN_COMMAND", f"unknown command {argv[0]!r}", hint, argv[0])
+
+
+# Commands of the Pro plugin, listed so the free edition can say where they come from.
+PRO_ONLY = {"marks", "click-mark", "find-text", "click-text", "wait-text", "wait-stable", "wait-change", "macro",
+            "journal", "report", "gif", "mcp", "guard", "clip", "downloads", "sessions", "type-mark"}
+
+
+def _shared_policy(argv):
+    """Shared mode lives on the user's X server: refuse what would move the user's focus."""
+    st = load_state()
+    if st and st.get("mode") != "nested" and os.environ.get("ADC_ALLOW_PHYSICAL") != "1" and argv[0] == "focus":
+        fail("ADC_POLICY", "`focus` would move the user's keyboard focus in shared mode",
+             "use click/type/set-value (headless), or ask the user before setting ADC_ALLOW_PHYSICAL=1", "focus")
+    return None
 
 
 if __name__ == "__main__":

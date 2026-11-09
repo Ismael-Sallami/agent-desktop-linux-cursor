@@ -1,0 +1,11 @@
+{
+  "name": "agent-desktop-linux-cursor",
+  "displayName": "Agent Desktop (Linux)",
+  "version": "2.0.0",
+  "description": "An isolated Linux desktop for AI agents: private X display, built-in accessibility engine, visible agent cursor, user hand-off and recording.",
+  "author": { "name": "Ismael Sallami", "url": "https://github.com/Ismael-Sallami" },
+  "homepage": "https://github.com/Ismael-Sallami/agent-desktop-linux-cursor",
+  "repository": "https://github.com/Ismael-Sallami/agent-desktop-linux-cursor",
+  "license": "MIT",
+  "keywords": ["computer-use", "desktop", "linux", "x11", "accessibility", "automation", "agent"]
+}
