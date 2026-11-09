@@ -4,3 +4,4 @@ __pycache__/
 *.log
 scripts/adc_pro.py
 dist/
+.claude/
