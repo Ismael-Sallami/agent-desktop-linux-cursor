@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b1f3b"/>
+      <stop offset="1" stop-color="#0b0d1a"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.62" cy="0.58" r="0.55">
+      <stop offset="0" stop-color="#7c5cff" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#7c5cff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="win" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#262b52"/>
+      <stop offset="1" stop-color="#171a33"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8f7bff"/>
+      <stop offset="1" stop-color="#36d6ff"/>
+    </linearGradient>
+    <linearGradient id="cur" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffb35c"/>
+      <stop offset="1" stop-color="#ff5c7a"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <rect width="512" height="512" rx="112" fill="url(#glow)"/>
+  <!-- user's desktop, faint, behind -->
+  <rect x="62" y="78" width="270" height="200" rx="22" fill="none" stroke="#ffffff" stroke-opacity="0.16" stroke-width="8"/>
+  <line x1="62" y1="120" x2="332" y2="120" stroke="#ffffff" stroke-opacity="0.12" stroke-width="6"/>
+  <!-- agent's desktop, in front -->
+  <rect x="140" y="160" width="310" height="252" rx="28" fill="url(#win)" stroke="url(#edge)" stroke-width="10"/>
+  <path d="M140 214 H450" stroke="url(#edge)" stroke-opacity="0.5" stroke-width="6"/>
+  <circle cx="178" cy="187" r="9" fill="#ff5c7a"/>
+  <circle cx="206" cy="187" r="9" fill="#ffb35c"/>
+  <circle cx="234" cy="187" r="9" fill="#3ddc97"/>
+  <!-- glide trail -->
+  <path d="M186 386 C 210 300, 268 262, 318 286" fill="none" stroke="#ffffff" stroke-opacity="0.55" stroke-width="7" stroke-linecap="round" stroke-dasharray="2 18"/>
+  <!-- click ripple -->
+  <circle cx="322" cy="290" r="26" fill="none" stroke="#36d6ff" stroke-opacity="0.9" stroke-width="5"/>
+  <circle cx="322" cy="290" r="46" fill="none" stroke="#36d6ff" stroke-opacity="0.35" stroke-width="4"/>
+  <!-- agent cursor -->
+  <path d="M322 290 L322 392 L346 368 L364 410 L386 400 L368 360 L402 358 Z"
+        fill="url(#cur)" stroke="#ffffff" stroke-width="9" stroke-linejoin="round"/>
+  <!-- label pill -->
+  <rect x="356" y="238" width="104" height="40" rx="20" fill="#36d6ff"/>
+  <text x="408" y="265" font-family="DejaVu Sans, Inter, sans-serif" font-size="22" font-weight="700" fill="#0b0d1a" text-anchor="middle">agent</text>
+</svg>

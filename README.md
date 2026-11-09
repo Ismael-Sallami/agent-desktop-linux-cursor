@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logo.png" alt="adc logo: the agent's own desktop window with its cursor" width="160">
+</p>
+
 # agent-desktop-linux-cursor
 
 An agent skill, Claude Code plugin and command-line tool (`adc`) that gives an AI agent its own
