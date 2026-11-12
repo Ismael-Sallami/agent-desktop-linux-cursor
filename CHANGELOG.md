@@ -14,8 +14,7 @@
 
 - Built-in AT-SPI accessibility engine (`scripts/adc_a11y.py`): `snapshot`, `find`, `wait`, `get`,
   `is`, `click`, `right-click`, `type`, `set-value`, `clear`, `select`, `toggle`, `check`,
-  `uncheck`, `expand`, `collapse`, `focus`, `scroll-to`, `list-apps`, `close-app`. The
-  agent-desktop CLI and Node.js are no longer required.
+  `uncheck`, `expand`, `collapse`, `focus`, `scroll-to`, `list-apps`, `close-app`. No external CLI or Node.js is required.
 - Correct screen coordinates for GTK 4 applications; labels for GTK 4 menu items; popovers listed
   under their expanded button.
 - Nested mode types with the real keyboard, scrolls off-screen elements into view before acting,

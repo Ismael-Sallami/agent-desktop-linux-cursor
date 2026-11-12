@@ -132,6 +132,4 @@ It is a paid edition with features for heavier production automation:
 
 ## License
 
-MIT. See [LICENSE](LICENSE). Earlier versions built on
-[agent-desktop](https://github.com/vercel-labs/agent-desktop); since 2.0 `adc` ships its own
-accessibility engine.
+MIT. See [LICENSE](LICENSE).
