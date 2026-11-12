@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.0.1
+
+- Fix: modifiers left held inside the nested display corrupted all later input. When the user's
+  focus leaves the Xephyr window mid-chord (Alt+Tab, a Super shortcut), Xephyr keeps Alt or Shift
+  pressed; `write` then turned `I` into Alt+Shift+I (Chrome's "Send feedback" dialog) and letters
+  into shortcuts, and `key --clearmodifiers` pressed them again afterwards. `key`, `write`,
+  `click` and `drag-xy` now release any held modifier on the nested display first.
+- Docs: how to pick a file in GTK/Chrome file dialogs (type the path, click Open; Return does not
+  confirm in Chrome).
+
 ## 2.0.0
 
 - Built-in AT-SPI accessibility engine (`scripts/adc_a11y.py`): `snapshot`, `find`, `wait`, `get`,

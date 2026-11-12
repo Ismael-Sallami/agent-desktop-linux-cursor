@@ -75,6 +75,55 @@ def xdo(st, *args):
     return subprocess.run(["xdotool", *map(str, args)], env=nenv(st), capture_output=True, text=True)
 
 
+def release_held_modifiers(st):
+    """Release modifier keys the nested display still believes are held.
+
+    The Xephyr window receives the user's real keyboard while it has focus. If the user leaves it
+    in the middle of a chord (Alt+Tab, a Super shortcut), Xephyr sees the press but never the
+    release, and every later synthetic keystroke carries that modifier: 'I' becomes Alt+Shift+I,
+    which in Chrome opens "Send feedback to Google", and letters turn into shortcuts. `xdotool type`
+    does not clear modifiers, and `xdotool key --clearmodifiers` presses them again afterwards, so
+    the stuck state survives. Returns the keycodes released."""
+    import ctypes
+    import ctypes.util
+
+    class ModMap(ctypes.Structure):
+        _fields_ = [("max_keypermod", ctypes.c_int), ("modifiermap", ctypes.POINTER(ctypes.c_ubyte))]
+
+    try:
+        x11 = ctypes.cdll.LoadLibrary(ctypes.util.find_library("X11") or "libX11.so.6")
+        xtst = ctypes.cdll.LoadLibrary(ctypes.util.find_library("Xtst") or "libXtst.so.6")
+    except OSError:
+        return []
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XGetModifierMapping.restype = ctypes.POINTER(ModMap)
+    x11.XGetModifierMapping.argtypes = [ctypes.c_void_p]
+    x11.XFreeModifiermap.argtypes = [ctypes.POINTER(ModMap)]
+    x11.XQueryKeymap.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    x11.XFlush.argtypes = x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    xtst.XTestFakeKeyEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+    dpy = x11.XOpenDisplay(st["display"].encode())
+    if not dpy:
+        return []
+    released = []
+    try:
+        mm = x11.XGetModifierMapping(dpy)
+        n = mm.contents.max_keypermod
+        modkeys = {mm.contents.modifiermap[i] for i in range(8 * n)} - {0}
+        x11.XFreeModifiermap(mm)
+        keys = ctypes.create_string_buffer(32)
+        x11.XQueryKeymap(dpy, keys)
+        for kc in sorted(modkeys):
+            if keys.raw[kc // 8] >> (kc % 8) & 1:
+                xtst.XTestFakeKeyEvent(dpy, kc, 0, 0)
+                released.append(kc)
+        x11.XFlush(dpy)
+    finally:
+        x11.XCloseDisplay(dpy)
+    return released
+
+
 def spawn(cmd, env, log):
     return subprocess.Popen(cmd, env=env, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
                             start_new_session=True).pid
@@ -296,6 +345,7 @@ def glide(st, ov, x, y, label=None, agent="agent"):
 
 def click(st, ov, x, y, button=1, count=1, label=None, agent="agent", mods=()):
     glide(st, ov, x, y, label, agent)
+    release_held_modifiers(st)
     for m in mods:
         xdo(st, "keydown", m)
     xdo(st, "click", "--repeat", count, "--delay", 90, button)
@@ -306,6 +356,7 @@ def click(st, ov, x, y, button=1, count=1, label=None, agent="agent", mods=()):
 
 def drag(st, ov, x1, y1, x2, y2, label=None, agent="agent"):
     glide(st, ov, x1, y1, label, agent)
+    release_held_modifiers(st)
     xdo(st, "mousedown", 1)
     ov({"op": "click", "agent": agent, "x": x1, "y": y1})
     dist = math.hypot(x2 - x1, y2 - y1)
@@ -340,6 +391,7 @@ def focus(st, target=None):
 def key(st, ov, combo, label=None, agent="agent"):
     if label:
         ov({"op": "label", "agent": agent, "label": label})
+    release_held_modifiers(st)
     xdo(st, "key", "--clearmodifiers", combo)
     time.sleep(0.08)
 
@@ -359,6 +411,7 @@ def write(st, ov, text, label=None, agent="agent", delay=45):
     through the nested display's own clipboard."""
     if label:
         ov({"op": "label", "agent": agent, "label": label})
+    release_held_modifiers(st)
     run = ""
 
     def flush():

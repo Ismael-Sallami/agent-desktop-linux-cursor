@@ -114,7 +114,9 @@ Run `adc --help` for the complete command list. A recorded demonstration is avai
 
 ## adc Pro
 
-[adc Pro](https://www.agensi.io) is a paid edition with features for heavier automation:
+**Agent Desktop for Linux Pro** is available on Agensi: [Agensi Storefront](https://www.agensi.io/creators/ismael) · [Agensi Skills Catalog](https://www.agensi.io/skills).
+
+It is a paid edition with features for heavier production automation:
 
 | | Free | Pro |
 |---|:-:|:-:|

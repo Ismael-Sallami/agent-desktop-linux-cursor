@@ -1,7 +1,7 @@
 {
   "name": "agent-desktop-linux-cursor",
   "displayName": "Agent Desktop (Linux)",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "An isolated Linux desktop for AI agents: private X display, built-in accessibility engine, visible agent cursor, user hand-off and recording.",
   "author": {
     "name": "Ismael Sallami",

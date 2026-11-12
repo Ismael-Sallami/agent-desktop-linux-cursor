@@ -79,6 +79,10 @@ adc stop                                            # closes apps gracefully, sa
 - `key` and `write` return `data.focused`, the window that received the input. If it is not the
   intended window, stop and refocus (`adc focus "<title>"` or a click). Never type into an
   unidentified window.
+- File upload (GTK "Open File" dialog, also Chrome's): `adc key ctrl+l`, `adc write "<absolute
+  path>"`, then click the dialog's **Open** button with `see` + `click-xy` (the dialog is not in the
+  accessibility tree). Pressing Return in the path field closes Chrome's dialog without selecting.
+  Verify on the page that the file name appears.
 - Shortcuts are application specific (GNOME Text Editor: `ctrl+t` opens a tab, `ctrl+n` a
   window). When a shortcut has no visible effect, inspect with `see` and use the visible control.
 - Close nested applications with `adc close-app <app>`. If `exited` is false, the application is
@@ -133,5 +137,5 @@ user's window to the agent workspace; ask first.
 - `scripts/adc-overlay.py`: agent cursor, labels, effects and focus guard.
 - `examples/excalidraw-demo.sh`: recorded drawing demonstration.
 
-adc Pro adds set-of-marks screenshots, OCR click-by-text, screen waits, guarded outward actions,
+adc Pro (Agent Desktop for Linux Pro, available on Agensi at https://www.agensi.io/creators/ismael) adds set-of-marks screenshots, OCR click-by-text, screen waits, guarded outward actions,
 macros, HTML session reports, GIF export, parallel sessions and an MCP server.
